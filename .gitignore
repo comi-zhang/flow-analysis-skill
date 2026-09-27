@@ -1,0 +1,21 @@
+# 真实流水绝不入库
+*.ndjson
+*.csv
+data/
+raw/
+masked/
+reports/
+*.duckdb
+*.sqlite
+*.key
+vault*.enc
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+.ruff_cache/
+
+# 系统
+.DS_Store
