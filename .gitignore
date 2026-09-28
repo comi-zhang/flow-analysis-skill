@@ -1,6 +1,10 @@
 # 真实流水绝不入库
 *.ndjson
 *.csv
+*.xlsx
+*.xls
+# 对账单 PDF 含真实姓名+完整卡号，最高敏感级
+*.pdf
 data/
 raw/
 masked/

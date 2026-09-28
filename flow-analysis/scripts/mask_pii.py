@@ -139,7 +139,7 @@ def load_field_map(path: str | None) -> dict:
 
 def mask_row(row: dict, masker: Masker, fmap: dict) -> dict:
     out = {}
-    text_fields, person_fields = set(fmap.get("text", [])), set(fmap.get("person", []))
+    person_fields = set(fmap.get("person", []))
     order_fields, skip = set(fmap.get("order", [])), set(fmap.get("skip", []))
     for key, value in row.items():
         if not isinstance(value, str) or not value or key in skip:
