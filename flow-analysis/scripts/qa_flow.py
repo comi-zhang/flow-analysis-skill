@@ -83,54 +83,80 @@ def minute_of(value) -> int | None:
     return None if (hh == 0 and mm == 0) else hh * 60 + mm
 
 
-def check_balance_chain(rows: list[dict], fmap: dict, tol: float = 0.02) -> dict:
-    """余额链：按来源文件+账户分组，相邻两笔「上笔余额 ± 金额 = 本笔余额」。
+def _unmatched_rows(items: list[dict], fmap: dict, tol: float) -> list[tuple[dict, float]]:
+    """返回「前序余额在同组余额集合中找不到」的记录，附带算出的前序余额。
 
-    **前提**：余额链只有在"记录顺序 = 真实发生顺序"时才有意义。
+    与记录顺序无关：只问「本笔的前序余额是否有对应记录」，不要求相邻。
 
-    - 来源有时间戳 → 可按时间排序，结论可信（confidence=high）
-    - 来源只有日期 → 同一日内多笔时日内顺序不可知，只能假定文件顺序即发生顺序，
-      结论是条件性的（confidence=assumed）
-
-    ⚠️ 实测教训：不做这个区分会得出完全错误的结论——曾因按文件顺序直接遍历，
-    把一家银行判为 5% 自洽，加上时间排序后其实是 94.8%；真正有问题的是另一家。
+        支出：前序余额 = 本笔余额 + 金额
+        收入：前序余额 = 本笔余额 − 金额
     """
-    groups: dict[tuple, list[dict]] = defaultdict(list)
+    pool = {round(num(get(r, "balance", fmap)), 2) for r in items}
+    bad: list[tuple[dict, float]] = []
+    for row in items:
+        balance = round(num(get(row, "balance", fmap)), 2)
+        signed = -num(get(row, "amount", fmap)) if get(row, "direction", fmap) == "支出" else num(get(row, "amount", fmap))
+        before = round(balance - signed, 2)
+        if not any(abs(before - b) <= tol for b in pool):
+            bad.append((row, before))
+    return bad
+
+
+def check_balance_chain(rows: list[dict], fmap: dict, tol: float = 0.02) -> dict:
+    """余额链校验（**与记录顺序无关**），按「来源文件」判定。
+
+    三个都踩过的坑，按踩的顺序写在这里：
+
+    1. **不能用相邻两笔相减**。它要求「记录顺序 = 真实发生顺序」，而这个前提经常
+       不成立：来源只有日期时日内顺序不可知，导出的行序也不保证与源文件一致。
+       实测教训：同一份数据按顺序比只有 49.6% 自洽，改成与顺序无关的判定后是 100%
+       ——差点据此判定这家银行的金额"只有一半可信"。
+    2. **不能按「账户/卡号」分组**。同一个来源里的多个卡号可能属于**同一个余额主体**
+       （同一账户的多张卡），也可能是卡号列本身解析不可靠。按卡号分组会把这些行切成
+       几条断链，制造出十几处**假断裂**。实测教训：某来源按卡号分组有 15 处断裂，
+       按来源合并后**为 0**——而且它的未匹配行的前序余额恰好都能在另一个"账户"里找到。
+    3. **健康值不是 100%**。账期首笔的前序余额发生在账期之前，天然找不到，所以
+       一个账期**完整的来源恰好有 1 笔未匹配**（若来源本身就是多张独立账户的合集，
+       则为账户数）。所以判据是「未匹配 ≤ 1」而不是「自洽率 = 100%」。
+
+    结论口径：
+
+    - `unmatched <= 1` → 链闭合，**金额与行数可信**（漏行/金额错都会把未匹配数推高）。
+    - `unmatched > 1` → 有 `unmatched - 1` 处断裂，逐条看 `samples` 回原始账单核对。
+    - `unmatched_if_split_by_account > accounts` 且来源级正常 → **账户/卡号列不可信**，
+      不要用它做账户维度分析（该列多半来自 PDF 折行的卡号单元格）。
+    """
+    by_source: dict[str, list[dict]] = defaultdict(list)
     for row in rows:
         if get(row, "balance", fmap) is not None:
-            groups[(get(row, "source", fmap), get(row, "account", fmap))].append(row)
-
-    per_source: dict[str, dict] = defaultdict(
-        lambda: {"ok": 0, "bad": 0, "samples": [], "accounts": 0, "date_only": False}
-    )
-    for (_source, _acct), items in groups.items():
-        items.sort(key=lambda r: str(get(r, "time", fmap) or ""))
-        source = str(get(items[0], "source", fmap))
-        per_source[source]["accounts"] += 1
-        if not any(has_time(get(r, "time", fmap)) for r in items):
-            per_source[source]["date_only"] = True
-        for prev, cur in zip(items, items[1:], strict=False):
-            signed = -num(get(cur, "amount", fmap)) if get(cur, "direction", fmap) == "支出" else num(get(cur, "amount", fmap))
-            if abs(num(get(prev, "balance", fmap)) + signed - num(get(cur, "balance", fmap))) <= tol:
-                per_source[source]["ok"] += 1
-            else:
-                per_source[source]["bad"] += 1
-                if len(per_source[source]["samples"]) < 3:
-                    per_source[source]["samples"].append(
-                        f"{get(cur, 'date', fmap)} {num(get(cur, 'amount', fmap)):,.2f} -> 余额 {get(cur, 'balance', fmap)}"
-                    )
+            by_source[str(get(row, "source", fmap))].append(row)
 
     out = {}
-    for source, stat in per_source.items():
-        total = stat["ok"] + stat["bad"]
+    for source, items in by_source.items():
+        accounts: dict[str, list[dict]] = defaultdict(list)
+        for r in items:
+            accounts[str(get(r, "account", fmap))].append(r)
+
+        bad = _unmatched_rows(items, fmap, tol)
+        bad_split = sum(len(_unmatched_rows(v, fmap, tol)) for v in accounts.values())
+        samples = [
+            f"{get(row, 'date', fmap)} {num(get(row, 'amount', fmap)):,.2f} "
+            f"余额 {num(get(row, 'balance', fmap)):,.2f}（前序 {before:,.2f} 无对应记录）"
+            for row, before in bad[:3]
+        ]
+        total = len(items)
         out[source] = {
             "checked": total,
-            "consistent": stat["ok"],
-            "inconsistent": stat["bad"],
-            "rate": round(stat["ok"] / total, 4) if total else None,
-            "accounts": stat["accounts"],
-            "confidence": "assumed" if stat["date_only"] else "high",
-            "samples": stat["samples"],
+            "consistent": total - len(bad),
+            "unmatched": len(bad),
+            "breaks": max(0, len(bad) - 1),
+            "rate": round((total - len(bad)) / total, 4) if total else None,
+            "accounts": len(accounts),
+            "unmatched_if_split_by_account": bad_split,
+            "chain_closed": len(bad) <= 1,
+            "account_column_suspect": bad_split > len(accounts) and len(bad) <= 1,
+            "date_only": not any(has_time(get(r, "time", fmap)) for r in items),
+            "samples": samples,
         }
     return out
 
@@ -242,19 +268,26 @@ def render_markdown(result: dict) -> str:
     lines = ["# 流水数据质检报告\n", f"记录总数：{result['total_rows']}\n"]
 
     lines.append("## 1. 余额链自洽性\n")
-    lines.append("| 来源 | 账户数 | 参与校验 | 自洽 | 不自洽 | 自洽率 | 可信度 |")
+    lines.append("| 来源 | 参与校验 | 自洽 | 未匹配 | 断裂 | 自洽率 | 判定 |")
     lines.append("| --- | ---: | ---: | ---: | ---: | ---: | --- |")
     for source, stat in sorted(result["balance"].items(), key=lambda x: -(x[1]["checked"] or 0)):
         rate = "—" if stat["rate"] is None else f"{stat['rate']:.1%}"
-        confidence = "时间可信" if stat.get("confidence") == "high" else "顺序假定（仅日期）"
+        verdict = "链闭合" if stat.get("chain_closed") else f"{stat.get('breaks', 0)} 处断裂"
+        if stat.get("account_column_suspect"):
+            verdict += "；账户列可疑"
         lines.append(
-            f"| {source} | {stat.get('accounts', 1)} | {stat['checked']} | {stat['consistent']} | "
-            f"{stat['inconsistent']} | {rate} | {confidence} |"
+            f"| {source} | {stat['checked']} | {stat['consistent']} | "
+            f"{stat['unmatched']} | {stat.get('breaks', 0)} | {rate} | {verdict} |"
         )
     lines.append(
-        "\n> 读法：**时间可信**的来源自洽率低 = 金额或顺序真有问题；"
-        "**顺序假定**的来源（只有日期）自洽率低，只说明「文件顺序与余额链不一致」，"
-        "需要对照原始对账单确认日内顺序，不能直接判定金额有错。\n"
+        "\n> 读法（**与记录顺序无关、按来源整体判定**）：\n> "
+        "1. 校验的是「本笔的前序余额能否在该来源的余额里找到」，所以导出丢失行序不影响结论。\n> "
+        "2. **未匹配 = 1 是健康的**——那是账期首笔，它的前序余额发生在账期之前。"
+        "判据是「未匹配 ≤ 1（链闭合）」，不是「自洽率 = 100%」。\n> "
+        "3. 自洽率天然接近 `1 − 1/笔数`，笔数少时偏低属正常，**不要**据此判定金额不可信。\n> "
+        "4. 判定为「账户列可疑」= 按账户/卡号拆分反而多出大量未匹配（同一账户多卡，"
+        "或卡号列来自 PDF 折行解析不可靠）。**不要用该列做账户维度分析。**\n> "
+        "5. 若要逐笔核对，用「未匹配」样例行回到原始对账单查证。\n"
     )
 
     tp = result["time_precision"]
